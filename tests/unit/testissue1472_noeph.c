@@ -4,12 +4,6 @@
 
 #include "openjpeg.h"
 
-typedef struct {
-    const OPJ_BYTE* data;
-    OPJ_SIZE_T data_len;
-    OPJ_SIZE_T offset;
-} test_mem_stream_t;
-
 typedef enum {
     TEST_DECODE_HEADER_FAILURE = -1,
     TEST_DECODE_FAILURE = 0,
@@ -18,6 +12,8 @@ typedef enum {
 
 #define ISSUE1472_SCOD_OFFSET 52
 #define TEST_CSTY_SOP 0x02
+
+#define TEST_TMP_FILENAME "testissue1472_noeph_tmp.bin"
 
 static const OPJ_BYTE issue1472_noeph[] = {
     0xff, 0x4f, 0xff, 0x51, 0x00, 0x2c, 0x00, 0x02, 0x04, 0x00, 0x00, 0x64,
@@ -34,99 +30,49 @@ static const OPJ_BYTE issue1472_noeph[] = {
     0xff, 0x93, 0xff, 0xff, 0x4f, 0xff, 0x51
 };
 
-static void test_error_callback(const char *msg, void *user_data)
+static void test_quiet_callback(const char *msg, void *user_data)
 {
     (void)msg;
     (void)user_data;
-}
-
-static void test_warning_callback(const char *msg, void *user_data)
-{
-    (void)msg;
-    (void)user_data;
-}
-
-static void test_info_callback(const char *msg, void *user_data)
-{
-    (void)msg;
-    (void)user_data;
-}
-
-static OPJ_SIZE_T test_read_callback(void* p_buffer, OPJ_SIZE_T p_nb_bytes,
-                                     void *p_user_data)
-{
-    test_mem_stream_t* mem_stream = (test_mem_stream_t*)p_user_data;
-    OPJ_SIZE_T bytes_to_read = p_nb_bytes;
-
-    if (mem_stream->offset >= mem_stream->data_len || p_nb_bytes == 0U) {
-        return (OPJ_SIZE_T)-1;
-    }
-
-    if (mem_stream->offset + p_nb_bytes > mem_stream->data_len) {
-        bytes_to_read = mem_stream->data_len - mem_stream->offset;
-    }
-
-    memcpy(p_buffer, mem_stream->data + mem_stream->offset, bytes_to_read);
-    mem_stream->offset += bytes_to_read;
-    return bytes_to_read;
-}
-
-static OPJ_OFF_T test_skip_callback(OPJ_OFF_T p_nb_bytes, void *p_user_data)
-{
-    test_mem_stream_t* mem_stream = (test_mem_stream_t*)p_user_data;
-
-    mem_stream->offset += (OPJ_SIZE_T)p_nb_bytes;
-    return p_nb_bytes;
-}
-
-static OPJ_BOOL test_seek_callback(OPJ_OFF_T p_nb_bytes, void * p_user_data)
-{
-    test_mem_stream_t* mem_stream = (test_mem_stream_t*)p_user_data;
-
-    mem_stream->offset = (OPJ_SIZE_T)p_nb_bytes;
-    return OPJ_TRUE;
-}
-
-static void test_set_scod(OPJ_BYTE *dst, OPJ_BYTE scod)
-{
-    memcpy(dst, issue1472_noeph, sizeof(issue1472_noeph));
-    dst[ISSUE1472_SCOD_OFFSET] = scod;
 }
 
 static test_decode_result_t test_decode_codestream(const OPJ_BYTE *data,
         OPJ_SIZE_T data_len, OPJ_CODEC_FORMAT codec_format)
 {
-    test_mem_stream_t mem_stream;
     opj_stream_t *stream = NULL;
     opj_codec_t *codec = NULL;
     opj_image_t *image = NULL;
     opj_dparameters_t parameters;
+    FILE *fp;
     test_decode_result_t result = TEST_DECODE_HEADER_FAILURE;
 
-    mem_stream.data = data;
-    mem_stream.data_len = data_len;
-    mem_stream.offset = 0U;
-
-    stream = opj_stream_create(1024, OPJ_TRUE);
-    if (stream == NULL) {
+    fp = fopen(TEST_TMP_FILENAME, "wb");
+    if (fp == NULL) {
         return TEST_DECODE_HEADER_FAILURE;
     }
+    if (fwrite(data, 1U, data_len, fp) != data_len) {
+        fclose(fp);
+        remove(TEST_TMP_FILENAME);
+        return TEST_DECODE_HEADER_FAILURE;
+    }
+    fclose(fp);
 
-    opj_stream_set_user_data(stream, &mem_stream, NULL);
-    opj_stream_set_user_data_length(stream, data_len);
-    opj_stream_set_read_function(stream, test_read_callback);
-    opj_stream_set_skip_function(stream, test_skip_callback);
-    opj_stream_set_seek_function(stream, test_seek_callback);
+    stream = opj_stream_create_default_file_stream(TEST_TMP_FILENAME, OPJ_TRUE);
+    if (stream == NULL) {
+        remove(TEST_TMP_FILENAME);
+        return TEST_DECODE_HEADER_FAILURE;
+    }
 
     codec = opj_create_decompress(codec_format);
     if (codec == NULL) {
         opj_stream_destroy(stream);
+        remove(TEST_TMP_FILENAME);
         return TEST_DECODE_HEADER_FAILURE;
     }
 
-    opj_set_info_handler(codec, test_info_callback, NULL);
-    opj_set_warning_handler(codec, test_warning_callback, NULL);
-    opj_set_error_handler(codec, test_error_callback, NULL);
+    opj_set_info_handler(codec, test_quiet_callback, NULL);
+    opj_set_warning_handler(codec, test_quiet_callback, NULL);
+    opj_set_error_handler(codec, test_quiet_callback, NULL);
 
     opj_set_default_decoder_parameters(&parameters);
     if (!opj_setup_decoder(codec, &parameters)) {
@@ -144,6 +90,7 @@ cleanup:
     opj_destroy_codec(codec);
     opj_stream_destroy(stream);
     opj_image_destroy(image);
+    remove(TEST_TMP_FILENAME);
     return result;
 }
 
@@ -191,11 +138,21 @@ static OPJ_BYTE *test_read_file(const char *filename, OPJ_SIZE_T *data_len)
     return data;
 }
 
+/* Set the SOP bit in the Scod byte of the first COD marker of the
+ * codestream. The search is anchored at the SOC marker so that incidental
+ * 0xff 0x52 byte pairs in JP2 wrapper boxes cannot be patched by mistake. */
 static OPJ_BOOL test_enable_sop_csty(OPJ_BYTE *data, OPJ_SIZE_T data_len)
 {
     OPJ_SIZE_T offset;
+    OPJ_BOOL soc_found = OPJ_FALSE;
 
     for (offset = 0U; offset + 4U < data_len; ++offset) {
+        if (!soc_found) {
+            if (data[offset] == 0xffU && data[offset + 1U] == 0x4fU) {
+                soc_found = OPJ_TRUE;
+            }
+            continue;
+        }
         if (data[offset] == 0xffU && data[offset + 1U] == 0x52U) {
             data[offset + 4U] |= TEST_CSTY_SOP;
             return OPJ_TRUE;
@@ -266,33 +223,34 @@ static int test_sop_optional_tolerated_eof(const char *data_root)
 
 int main(int argc, char **argv)
 {
-    OPJ_BYTE issue1472_prt_only[sizeof(issue1472_noeph)];
-    OPJ_BYTE issue1472_eph_required[sizeof(issue1472_noeph)];
-    test_decode_result_t result;
+    /* The embedded codestream carries Scod = 0x03 (PRT+SOP) at offset 52;
+     * the other entries derive the PRT-only and PRT+SOP+EPH variants. */
+    static const struct {
+        OPJ_BYTE scod;
+        const char *description;
+    } malformed_variants[] = {
+        { 0x03, "no-EPH (PRT+SOP)" },
+        { 0x01, "PRT-only" },
+        { 0x07, "EPH-required (PRT+SOP+EPH)" }
+    };
+    OPJ_BYTE codestream[sizeof(issue1472_noeph)];
+    size_t i;
 
-    result = test_decode_codestream(issue1472_noeph, sizeof(issue1472_noeph),
-                                    OPJ_CODEC_J2K);
-    if (result != TEST_DECODE_FAILURE) {
-        fprintf(stderr, "Malformed no-EPH codestream unexpectedly avoided decode failure\n");
-        return 1;
-    }
+    for (i = 0U; i < sizeof(malformed_variants) / sizeof(malformed_variants[0]);
+            ++i) {
+        test_decode_result_t result;
 
-    test_set_scod(issue1472_prt_only, 0x01);
+        memcpy(codestream, issue1472_noeph, sizeof(issue1472_noeph));
+        codestream[ISSUE1472_SCOD_OFFSET] = malformed_variants[i].scod;
 
-    result = test_decode_codestream(issue1472_prt_only, sizeof(issue1472_prt_only),
-                                    OPJ_CODEC_J2K);
-    if (result != TEST_DECODE_FAILURE) {
-        fprintf(stderr, "PRT-only malformed codestream unexpectedly avoided decode failure\n");
-        return 1;
-    }
-
-    test_set_scod(issue1472_eph_required, 0x07);
-
-    result = test_decode_codestream(issue1472_eph_required,
-                                    sizeof(issue1472_eph_required), OPJ_CODEC_J2K);
-    if (result != TEST_DECODE_FAILURE) {
-        fprintf(stderr, "EPH-required malformed codestream unexpectedly avoided decode failure\n");
-        return 1;
+        result = test_decode_codestream(codestream, sizeof(codestream),
+                                        OPJ_CODEC_J2K);
+        if (result != TEST_DECODE_FAILURE) {
+            fprintf(stderr,
+                    "%s malformed codestream unexpectedly avoided decode failure\n",
+                    malformed_variants[i].description);
+            return 1;
+        }
     }
 
     return test_sop_optional_tolerated_eof(argc > 1 ? argv[1] : NULL);

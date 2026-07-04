@@ -21,7 +21,9 @@ foreach(ut ${unit_test})
   endif()
 endforeach()
 
-set_tests_properties(testissue1472_noeph PROPERTIES TIMEOUT 10)
+# Guards against the pre-fix issue1472 unbounded loop (which never returned);
+# generous enough for slow or instrumented (valgrind/sanitizer) runs.
+set_tests_properties(testissue1472_noeph PROPERTIES TIMEOUT 30)
 
 add_executable(testjp2 testjp2.c)
 target_link_libraries(testjp2 openjp2)
